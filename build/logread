@@ -1,0 +1,208 @@
+#!/usr/bin/python
+"""logread
+Usage:
+    logread -K <token> -S <log>
+    logread -K <token> -R (-E <name> | -G <name>) <log>
+    logread -K <token> -T (-E <name> | -G <name>) <log>
+    logread -K <token> -I (-E <name> | -G <name>) [(-E <name> | -G <name>) ...] <log>
+
+Options:
+    -K token            Token used to authenticate the log. 
+    -S                  Print the current state of the log to stdout. 
+    -R                  Give a list of all rooms entered by an employee or guest.
+    -T                  Gives the total time spent in the gallery by an employee or guest.
+    -I                  Prints the rooms, as a comma-separated list of room IDs,
+                        that were occupied by all the specified employees and guests
+                        at the same time over the complete history of the gallery.
+    -E name             Name of employee.     
+    -G name             Name of guest. 
+    log                 The path to the file containing the event log.
+"""
+
+from docopt import docopt
+from schema import Schema, And, Or, Use, SchemaError
+import os , sys
+import pickle
+import base64
+import hashlib
+from Crypto.Cipher import AES    #TODO AES shown as error in python 3
+from Crypto import Random        #TODO Random shown as error in python 3
+
+
+def decode(fd, key):
+    
+    BS = AES.block_size
+    deserialize = lambda s : pickle.loads(s)
+    compute_sum = lambda s : hashlib.sha512(s).digest()
+    cksum_size = hashlib.sha512().digest_size
+    #   2.7.8     derive_key = lambda s : hashlib.pbkdf2_hmac('sha256', self.key, b'oursalt', 100000).digest()
+    derive_key = lambda s : hashlib.sha256(s).digest()
+    unpad_it = lambda s : s[:-ord(s[-1])]
+    
+    def decrypt_it(data):
+        IV = data[:BS]
+        cipher = AES.new(derive_key(key), AES.MODE_CBC, IV)
+        (cksum, payload) = (None, None)
+        try:
+            mydata = unpad_it(cipher.decrypt(data[AES.block_size:]))
+            payload = mydata[cksum_size:]
+            cksum = mydata[:cksum_size]
+        except:
+            print("integrity violation")
+            sys.exit(255)
+        return (cksum, payload)
+
+    def log_error():
+        data = fd.read()
+        if data == "":
+            return {}
+        else:
+            # File is encoded for human readbility
+            (cksum, payload) = decrypt_it(data)
+            if cksum == compute_sum(payload):
+                try:
+                    logdict = deserialize(payload)
+                except:
+                    print("invalid")
+                    sys.exit(255)
+                return logdict
+            else:
+                print("invalid")
+                sys.exit(255)
+
+    return log_error()
+
+def max_time(d):
+    last_event = sorted([event[1][-1] for event in d.values()],key = lambda e : e[0])[-1]
+    return last_event[0]
+
+def print_status(logdict):
+    
+    mykeys = logdict.keys()
+    last_events = {name:max(logdict[name][1], key = lambda t: t[0]) for name in mykeys}
+    last_room = {name:event[2] for name,event in last_events.items() if event[1] == 'A' and event[2] is not None}
+    
+    def present(k):
+        return not(last_events[k][1] == 'L' and last_events[k][2] is None)
+    
+    print( ','.join(sorted([k for k in mykeys if (logdict[k][0] == 'Employee' and present(k)) ])))
+    print( ','.join(sorted([k for k in mykeys if (logdict[k][0] == 'Guest' and present(k)) ])))
+    
+    inv_last_room = {}
+    for k,v in last_room.items():
+        inv_last_room[v] = inv_last_room.get(v,[])
+        inv_last_room[v].append(k)
+    
+    
+    for key in sorted(inv_last_room):
+        print("%s: %s" % (key, ','.join(sorted(inv_last_room[key]))))
+
+    
+    
+def print_room_list(name, logdict):
+    
+    event_list = logdict[name][1]
+    #print(event_list)
+    #TODO sort the event_list on time of event
+    print(','.join([str(room) for (t,event,room) in event_list if event == 'A' and room is not None]))
+    
+
+def print_time(name,logdict):
+    in_time = 0
+    entry_time = -1
+    for myevent in logdict[name][1]:
+        if (myevent[1] == 'A' and myevent[2] is None):
+            entry_time = myevent[0] 
+        elif (myevent[1] == 'L' and myevent[2] is None):
+            in_time += myevent[0] - entry_time 
+            entry_time = -1
+    if entry_time > -1:
+        in_time += max_time(logdict) - entry_time
+
+    print in_time
+
+
+def print_interaction(person_to_check,logdict):
+
+    event_list = sorted([(name,time,action,room) for name in logdict.keys() if name in person_to_check for time,action,room  in logdict[name][1] if room is not None], key = lambda elem : elem[1])
+
+    list_of_room =[]
+    room_dict = {}
+
+    for elem in event_list:
+        name,time,action,room = elem
+        if room not in list_of_room :
+            if action == 'A' :
+                if room not in room_dict.keys() : room_dict[room] = []
+                room_dict[room].append(name)
+                if room_dict[room] == person_to_check : list_of_room.append(room)
+            else : room_dict[room].remove(name) #action is leave
+
+    print(','.join(map(str,sorted(list_of_room))))
+    
+
+def Main():
+    
+    # schema def
+
+    schema_log_access = Schema({'-K' : And(Use(str), lambda s: s.isalnum(), lambda s: s != ""),
+                                '<log>' : Use(lambda f : open(f,'r')),
+                                str : object})
+
+    schema_status = Schema({'-R': False,
+                           '-T': False,
+                           '-I': False,
+                           '-E': [],
+                           '-G': [],
+                           '-S': True,
+                           str : object})
+                   
+
+    schema_name = Schema({'-S': False,
+                           '-E': Or([],And(Use(list),lambda l: all(i.isalpha() for i in l))),
+                           '-G': Or([],And(Use(list),lambda l: all(i.isalpha() for i in l))),
+                           str : object})
+   
+    
+    try:
+  
+        args = docopt(__doc__, help = False)
+    
+    except :
+        print("invalid")
+        sys.exit(255)
+    
+    try:
+
+        args = schema_log_access.validate(args)
+
+        logdict = decode(args['<log>'],args['-K'])
+
+
+        if args['-S']:
+            args = schema_status.validate(args)
+            print_status(logdict)
+        else :
+            args = schema_name.validate(args)
+            
+            list_employee = [k for k in logdict.keys() if logdict[k][0] == 'Employee']
+            list_guest = [k for k in logdict.keys() if logdict[k][0] == 'Guest']            
+            
+            valid_employee = list(set(list_employee).intersection(args['-E']))
+            valid_guest = list(set(list_guest).intersection(args['-G']))
+            
+            valid_employee.extend(valid_guest)
+            
+            if valid_employee != [] : 
+                if args['-R']: print_room_list(valid_employee[0],logdict)
+                if args['-T']: print_time(valid_employee[0],logdict)
+                if args['-I']: print_interaction(valid_employee,logdict)
+
+    except SchemaError :
+        print("invalid")
+        sys.exit(255)
+
+    
+if __name__ == '__main__':
+    Main()
+    sys.exit(0)

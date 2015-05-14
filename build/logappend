@@ -1,0 +1,273 @@
+#!/usr/bin/python
+"""logappend
+Usage:
+    logappend -T <timestamp> -K <token> (-E <employee-name> | -G <guest-name>) (-A | -L) [-R <room-id>] <log>
+    logappend -B <file>
+
+Options:
+    -T timestamp        Time the event is recorded.
+    -K token            Token used to authenticate the log. 
+    -E employee-name    Name of employee. 
+    -G guest-name       Name of guest. 
+    -A                  Specify that the current event is an arrival;
+    -L                  Specify that the current event is a departure,
+    -R room-id          Specifies the room ID for an event. 
+    log                 The path to the file containing the event log.
+    -B file             Specifies a batch file of commands. 
+"""
+
+from docopt import docopt
+from schema import Schema, And, Or, Use, SchemaError
+import os , sys
+import pickle
+import base64
+import hashlib
+from Crypto.Cipher import AES    #TODO AES shown as error in python 3
+from Crypto import Random        #TODO Random shown as error in python 3
+
+
+def valid_semantic(args, logdict):
+    
+    myvalues = logdict.values()
+    mykeys = logdict.keys()
+    
+    def time():
+        if logdict == {}:
+            # If no event yet, no time restriction
+            return 0
+        last_event = sorted([event[1][-1] for event in myvalues],key = lambda e : e[0])[-1]
+        return last_event[0]
+
+    def employees():
+        if logdict == {} :
+            return []
+        else:
+            return [k for k in mykeys if logdict[k][0] == 'Employee' ]
+        
+    def guests():
+        if logdict == {} :
+            return []
+        else:
+            return [k for k in mykeys if logdict[k][0] == 'Guest' ]
+            
+    def valid_time(t):
+        if t <= time():
+            return False
+        else:
+            return True
+
+    def valid_employee(name):
+        if name is None:
+            return True
+        elif name in guests():
+            return False
+        else:
+            return True
+
+    def valid_guest(name):
+        if name is None:
+            return True
+        elif name in employees():
+            return False
+        else:
+            return True
+
+    return  valid_time(args['-T']) and valid_guest(args['-G']) and valid_employee(args['-E'])
+
+
+
+def process(args, logdict):
+
+    def act(person,role, time, action, room):
+        if person not in logdict.keys() : # this is a gallery entry
+            if room is None and action == 'A':
+                logdict[person] = (role,[(time,action,room)])
+            else :
+                return False
+        else :
+            events = logdict[person][1]
+            last_action = events[-1][1]
+            last_room = events[-1][2]
+            if action == 'L':
+                if ((last_action == 'A' and last_room == room) or                       #get-out of the previous room
+                   (last_action == 'L' and last_room is not None and room is None )):   #get-out of the gallery
+                    events.append((time,action,room))
+                    logdict[person]=(role,events)
+                else :
+                    return False
+            else:                   #action = 'A'
+                if ((last_action == 'L' and last_room is not None and room is not None) or # the guy is in the gallery
+                        (last_action == 'L' and last_room is None and room is None) or     # the guy is re-entering the gallery
+                        (last_action == 'A' and last_room is None and room is not None)):  # the guy re-entered the gallery
+                    events.append((time,action,room))
+                    logdict[person]=(role,events)
+                else:
+                    return False
+        return True
+
+    person = args['-G'] if args['-E'] is None else args['-E']
+    role = 'Guest' if args['-E'] is None else 'Employee'
+    action = 'A' if args['-A'] else 'L'
+    return act(person, role, args['-T'], action, args['-R'])
+
+
+BS = AES.block_size
+compute_sum = lambda s : hashlib.sha512(s).digest()
+cksum_size = hashlib.sha512().digest_size
+#   2.7.8     derive_key = lambda s : hashlib.pbkdf2_hmac('sha256', self.key, b'oursalt', 100000).digest()
+derive_key = lambda s : hashlib.sha256(s).digest()
+
+def encode(logdict, key):
+    serialize = lambda o : pickle.dumps(o)
+
+    def pad_it(payload):
+        pad_len = BS - len(payload) % BS
+        return payload + pad_len * chr(pad_len)
+    
+    def crypt_it(payload):
+        IV = Random.new().read(BS)
+        cipher = AES.new(derive_key(key), AES.MODE_CBC, IV)
+        return IV + cipher.encrypt(pad_it(compute_sum(payload) + payload))
+    
+    payload = serialize(logdict)
+
+    return crypt_it(payload)
+
+
+def decode(fd, key):
+    
+    deserialize = lambda s : pickle.loads(s)
+    unpad_it = lambda s : s[:-ord(s[-1])]
+    
+    def decrypt_it(data):
+        IV = data[:BS]
+        cipher = AES.new(derive_key(key), AES.MODE_CBC, IV)
+        (cksum, payload) = (None, None)
+        try:
+            mydata = unpad_it(cipher.decrypt(data[AES.block_size:]))
+            payload = mydata[cksum_size:]
+            cksum = mydata[:cksum_size]
+        except:
+            print("invalid")
+            sys.exit(255)
+        return (cksum, payload)
+
+    def log_error():
+        data = fd.read()
+        if data == "":
+            return {}
+        else:
+            (cksum, payload) = decrypt_it(data)
+            if cksum == compute_sum(payload):
+                try:
+                    return deserialize(payload)
+                except:
+                    print("invalid")
+                    sys.exit(255)
+            else:
+                print("invalid")
+                sys.exit(255)
+
+    return log_error()
+
+def Main():
+
+    def invalid():
+        print("invalid")
+        sys.exit(255)
+        
+    def securityviolation():
+        print("security violation")
+        sys.exit(255)
+
+    def store(logdict, filename, key):
+        try:
+            fd = open(filename, 'w')
+            fd.write(encode(logdict, key))
+            fd.close
+        except:
+            securityviolation()
+
+    schema_batch = Schema({'-B': Use(open),
+                           '-T': None,
+                           '-K': None,
+                           '-E': None,
+                           '-G': None,
+                           '-A': False,
+                           '-L': False,
+                           '-R': None,
+                           '<log>': None})
+    
+    schema_log_access = Schema({'-K' : And(Use(str), lambda s: s.isalnum(), lambda s: s != ""),
+                                '<log>' : Use(lambda f : open(f,'a+')),
+                                str : object})
+
+    schema_line = Schema({  '-E': Or(None,And(Use(str), lambda s: s != "" and s.isalpha())),
+                            '-G': Or(None,And(Use(str), lambda s: s != "" and s.isalpha())),
+                            '-T': And(Use(int), lambda t: 0 <= t),
+                            '-A': bool,
+                            '-L': bool,
+                            '-R': Or(None,And(Use(int), lambda i: 0 <= i)),
+                            str : object })
+  
+    try:
+        args = docopt(__doc__, help = False)
+    except:
+        print("invalid")
+        sys.exit(255)
+        
+    try:
+        if args['-B'] is not None:
+            args = schema_batch.validate(args)
+            filename = None
+            fd = None
+            for line in args['-B'] :
+                    args = docopt(__doc__, line.split())
+                    if filename != args['<log>']:
+                        if fd != None:
+                            store(logdict, filename, key)
+                        
+                        filename = args['<log>']
+                        args = schema_log_access.validate(args)
+                        fd = args['<log>']
+                        key = args['-K']
+
+                        logdict = decode(fd, key)
+                        fd.close
+
+                    args = schema_line.validate(args)
+
+                    if valid_semantic(args, logdict):
+                        process(args, logdict)
+                        
+            store(logdict, filename, key)
+            sys.exit(0)
+            
+        else :
+
+            filename = args['<log>']
+            
+            args = schema_log_access.validate(args)
+            fd = args['<log>']
+            key = args['-K']
+
+            logdict = decode(fd, key)
+            fd.close
+
+            args = schema_line.validate(args)
+
+            if valid_semantic(args, logdict):
+                if process(args, logdict) == False:
+                    invalid()
+                store(logdict, filename, key)
+                
+                sys.exit(0)
+            else:
+                invalid()
+            
+    except SchemaError:
+        invalid()
+
+if __name__ == '__main__':
+    Main()
+    
